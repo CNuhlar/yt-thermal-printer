@@ -1,23 +1,26 @@
 // YouTube → XP-80 thermal printer content script.
-// Watches the watch page for video changes inside a playlist and POSTs to
-// the local yt_printer.py server.
+// Detects video changes inside a playlist and POSTs the current track to
+// the local yt_printer.py server. To avoid printing the previous track's
+// metadata during YouTube's SPA transition, it waits until the DOM has
+// actually flipped to the new video (via <ytd-watch-flexy video-id="...">)
+// before scraping.
 
 (() => {
   const DEFAULT_ENDPOINT = "http://127.0.0.1:7878/print";
-  const POLL_MS = 1000;
-  const SETTLE_MS = 1500;    // wait for SPA to load metadata
+  const URL_POLL_MS = 700;        // how often to look for a URL change
+  const META_POLL_MS = 250;       // how often to poll while waiting for DOM
+  const META_MAX_ATTEMPTS = 40;   // ~10s budget for DOM to settle
+  const POST_SETTLE_MS = 400;     // extra grace after flexy flips
   const REQUIRE_PLAYLIST = true;
 
-  let lastVideoId = null;
-  let pendingTimer = null;
+  let lastSeenVideoId = null;     // last URL videoId we noticed
+  let lastSentVideoId = null;     // last videoId we actually printed
   let endpoint = DEFAULT_ENDPOINT;
   let enabled = true;
 
-  // Read settings (popup can change these)
-  chrome.storage?.local.get(["endpoint", "enabled", "requirePlaylist"], (cfg) => {
+  chrome.storage?.local.get(["endpoint", "enabled"], (cfg) => {
     if (cfg.endpoint) endpoint = cfg.endpoint;
     if (typeof cfg.enabled === "boolean") enabled = cfg.enabled;
-    // requirePlaylist read on demand below
   });
 
   chrome.storage?.onChanged?.addListener((changes) => {
@@ -36,8 +39,8 @@
     return `${m}:${String(s).padStart(2, "0")}`;
   }
 
-  function text(selectorList) {
-    for (const sel of selectorList) {
+  function textFrom(selectors) {
+    for (const sel of selectors) {
       const el = document.querySelector(sel);
       if (el && el.textContent && el.textContent.trim()) {
         return el.textContent.trim();
@@ -46,14 +49,14 @@
     return "";
   }
 
-  function gather() {
-    const videoId = qs("v");
-    if (!videoId) return null;
+  function watchFlexyVideoId() {
+    const flexy = document.querySelector("ytd-watch-flexy");
+    return flexy ? flexy.getAttribute("video-id") : null;
+  }
 
-    const playlistId = qs("list");
-    if (REQUIRE_PLAYLIST && !playlistId) return null;
-
-    const title = text([
+  function gather(videoId) {
+    const title = textFrom([
+      "ytd-watch-metadata h1 yt-formatted-string",
       "h1.ytd-watch-metadata yt-formatted-string",
       "h1.ytd-watch-metadata",
       "h1.title yt-formatted-string",
@@ -61,7 +64,7 @@
       "ytd-video-primary-info-renderer h1",
     ]) || document.title.replace(/ - YouTube$/, "");
 
-    const channel = text([
+    const channel = textFrom([
       "ytd-channel-name#channel-name a",
       "ytd-channel-name a",
       "#owner #channel-name a",
@@ -69,11 +72,10 @@
       "#upload-info #channel-name a",
     ]);
 
-    const playlist = text([
+    const playlist = textFrom([
       "ytd-playlist-panel-renderer #playlist-title",
       "ytd-playlist-panel-renderer h3 a",
       "ytd-playlist-panel-renderer h3",
-      ".ytd-playlist-panel-renderer.title",
     ]);
 
     const video = document.querySelector("video.html5-main-video, video");
@@ -86,33 +88,61 @@
   }
 
   function send(info) {
+    console.log("[yt-printer] POST →", info.videoId, info.title);
     fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(info),
     })
-      .then((r) => console.log("[yt-printer]", r.status, info.title))
-      .catch((e) => console.warn("[yt-printer] failed:", e));
+      .then((r) => console.log("[yt-printer] response", r.status))
+      .catch((e) => console.warn("[yt-printer] fetch failed:", e));
+  }
+
+  function awaitAndSend(targetId, attempts) {
+    attempts = attempts || 0;
+
+    // Bail if URL moved on to another video while we waited.
+    if (qs("v") !== targetId) {
+      console.log("[yt-printer] abort wait, URL changed away from", targetId);
+      return;
+    }
+
+    // Wait until ytd-watch-flexy[video-id] matches — that's YouTube's
+    // signal that the new video's metadata is now wired into the DOM.
+    const flexyId = watchFlexyVideoId();
+    if (flexyId !== targetId) {
+      if (attempts >= META_MAX_ATTEMPTS) {
+        console.warn("[yt-printer] gave up waiting for DOM; sending anyway:", targetId);
+      } else {
+        setTimeout(() => awaitAndSend(targetId, attempts + 1), META_POLL_MS);
+        return;
+      }
+    }
+
+    // Grace for title / channel rendering after the flexy attribute flips.
+    setTimeout(() => {
+      if (qs("v") !== targetId) return;
+      if (lastSentVideoId === targetId) return;
+      const info = gather(targetId);
+      if (!info.title) return;
+      lastSentVideoId = targetId;
+      send(info);
+    }, POST_SETTLE_MS);
   }
 
   function check() {
     if (!enabled) return;
-    const info = gather();
-    if (!info) return;
-    if (info.videoId === lastVideoId) return;
-    if (!info.title) return; // wait for metadata to load
+    const videoId = qs("v");
+    if (!videoId) return;
+    if (REQUIRE_PLAYLIST && !qs("list")) return;
+    if (videoId === lastSeenVideoId) return;
 
-    lastVideoId = info.videoId;
-
-    if (pendingTimer) clearTimeout(pendingTimer);
-    pendingTimer = setTimeout(() => {
-      const fresh = gather();
-      if (!fresh) return;
-      if (fresh.videoId === lastVideoId) send(fresh);
-    }, SETTLE_MS);
+    lastSeenVideoId = videoId;
+    console.log("[yt-printer] new video detected in URL:", videoId);
+    awaitAndSend(videoId);
   }
 
-  setInterval(check, POLL_MS);
+  setInterval(check, URL_POLL_MS);
   document.addEventListener("yt-navigate-finish", check);
   window.addEventListener("yt-page-data-updated", check);
 
