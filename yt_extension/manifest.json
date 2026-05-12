@@ -1,0 +1,27 @@
+{
+  "manifest_version": 3,
+  "name": "YouTube Thermal Printer",
+  "version": "1.0",
+  "description": "Sends now-watching info from YouTube playlists to a local thermal printer (XP-80 via yt_printer.py server).",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "*://www.youtube.com/*",
+    "*://music.youtube.com/*",
+    "http://127.0.0.1:7878/*",
+    "http://localhost:7878/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "*://www.youtube.com/watch*",
+        "*://music.youtube.com/*"
+      ],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_title": "YouTube Thermal Printer",
+    "default_popup": "popup.html"
+  }
+}

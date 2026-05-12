@@ -1,0 +1,31 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <style>
+    body { font: 13px system-ui, sans-serif; width: 260px; padding: 12px; }
+    label { display: block; margin: 8px 0 4px; }
+    input[type=text] { width: 100%; box-sizing: border-box; padding: 6px; }
+    .row { display: flex; align-items: center; gap: 6px; margin-top: 10px; }
+    button { padding: 6px 10px; cursor: pointer; }
+    .status { margin-top: 10px; font-size: 12px; color: #555; }
+    .ok { color: #060; } .err { color: #a00; }
+  </style>
+</head>
+<body>
+  <h3 style="margin:0">YT → XP-80</h3>
+
+  <label><input type="checkbox" id="enabled" checked /> Enabled</label>
+
+  <label>Server endpoint</label>
+  <input type="text" id="endpoint" value="http://127.0.0.1:7878/print" />
+
+  <div class="row">
+    <button id="test">Test print</button>
+    <button id="ping">Ping server</button>
+  </div>
+  <div class="status" id="status"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>
