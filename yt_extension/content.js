@@ -1,20 +1,18 @@
 // YouTube → XP-80 thermal printer content script.
-// Detects video changes inside a playlist and POSTs the current track to
-// the local yt_printer.py server. To avoid printing the previous track's
-// metadata during YouTube's SPA transition, it waits until the DOM has
-// actually flipped to the new video (via <ytd-watch-flexy video-id="...">)
-// before scraping.
+// Detects video changes inside a playlist and POSTs the current track to the
+// local yt_printer.py server. Waits until <ytd-watch-flexy video-id="...">
+// matches the URL's v= and the title h1 has rendered, so we never scrape the
+// previous track's metadata during YouTube's SPA transition.
 
 (() => {
   const DEFAULT_ENDPOINT = "http://127.0.0.1:7878/print";
-  const URL_POLL_MS = 700;        // how often to look for a URL change
-  const META_POLL_MS = 250;       // how often to poll while waiting for DOM
-  const META_MAX_ATTEMPTS = 40;   // ~10s budget for DOM to settle
-  const POST_SETTLE_MS = 400;     // extra grace after flexy flips
+  const URL_POLL_MS = 600;
+  const META_POLL_MS = 250;
+  const META_MAX_ATTEMPTS = 60;   // ~15s budget for DOM to settle
   const REQUIRE_PLAYLIST = true;
 
-  let lastSeenVideoId = null;     // last URL videoId we noticed
-  let lastSentVideoId = null;     // last videoId we actually printed
+  let lastSentVideoId = null;
+  const inFlight = new Set();
   let endpoint = DEFAULT_ENDPOINT;
   let enabled = true;
 
@@ -55,14 +53,16 @@
   }
 
   function gather(videoId) {
-    const title = textFrom([
+    const strictTitle = textFrom([
       "ytd-watch-metadata h1 yt-formatted-string",
       "h1.ytd-watch-metadata yt-formatted-string",
       "h1.ytd-watch-metadata",
       "h1.title yt-formatted-string",
       "#title h1 yt-formatted-string",
       "ytd-video-primary-info-renderer h1",
-    ]) || document.title.replace(/ - YouTube$/, "");
+    ]);
+
+    const title = strictTitle || document.title.replace(/ - YouTube$/, "");
 
     const channel = textFrom([
       "ytd-channel-name#channel-name a",
@@ -84,7 +84,10 @@
 
     const thumbnail = `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`;
 
-    return { videoId, title, channel, playlist, duration, elapsed, thumbnail };
+    return {
+      videoId, title, channel, playlist, duration, elapsed, thumbnail,
+      _strictTitle: !!strictTitle,
+    };
   }
 
   function send(info) {
@@ -101,33 +104,40 @@
   function awaitAndSend(targetId, attempts) {
     attempts = attempts || 0;
 
-    // Bail if URL moved on to another video while we waited.
+    // Bail if URL moved on while we were waiting.
     if (qs("v") !== targetId) {
-      console.log("[yt-printer] abort wait, URL changed away from", targetId);
+      inFlight.delete(targetId);
+      console.log("[yt-printer] abort, URL moved away from", targetId);
       return;
     }
 
-    // Wait until ytd-watch-flexy[video-id] matches — that's YouTube's
-    // signal that the new video's metadata is now wired into the DOM.
-    const flexyId = watchFlexyVideoId();
-    if (flexyId !== targetId) {
+    // Already printed this one in a previous round.
+    if (lastSentVideoId === targetId) {
+      inFlight.delete(targetId);
+      return;
+    }
+
+    const flexyMatches = watchFlexyVideoId() === targetId;
+    const info = gather(targetId);
+    const ready = flexyMatches && info._strictTitle;
+
+    if (!ready) {
       if (attempts >= META_MAX_ATTEMPTS) {
-        console.warn("[yt-printer] gave up waiting for DOM; sending anyway:", targetId);
+        console.warn(
+          "[yt-printer] gave up waiting after",
+          attempts, "attempts, sending best-effort:", targetId,
+        );
+        // fall through to send whatever we have
       } else {
         setTimeout(() => awaitAndSend(targetId, attempts + 1), META_POLL_MS);
         return;
       }
     }
 
-    // Grace for title / channel rendering after the flexy attribute flips.
-    setTimeout(() => {
-      if (qs("v") !== targetId) return;
-      if (lastSentVideoId === targetId) return;
-      const info = gather(targetId);
-      if (!info.title) return;
-      lastSentVideoId = targetId;
-      send(info);
-    }, POST_SETTLE_MS);
+    if (!info.title) info.title = "Unknown title";
+    lastSentVideoId = targetId;
+    inFlight.delete(targetId);
+    send(info);
   }
 
   function check() {
@@ -135,16 +145,42 @@
     const videoId = qs("v");
     if (!videoId) return;
     if (REQUIRE_PLAYLIST && !qs("list")) return;
-    if (videoId === lastSeenVideoId) return;
+    if (videoId === lastSentVideoId) return;
+    if (inFlight.has(videoId)) return;
 
-    lastSeenVideoId = videoId;
-    console.log("[yt-printer] new video detected in URL:", videoId);
+    inFlight.add(videoId);
+    console.log("[yt-printer] new video detected:", videoId);
     awaitAndSend(videoId);
   }
 
+  // Poll the URL for changes (covers cases where YouTube's SPA events miss).
   setInterval(check, URL_POLL_MS);
+
+  // Hook YouTube's SPA navigation events for instant reaction.
   document.addEventListener("yt-navigate-finish", check);
   window.addEventListener("yt-page-data-updated", check);
+
+  // Also watch ytd-watch-flexy's video-id attribute directly — this flips
+  // exactly when YouTube finishes binding a new video's metadata, which is
+  // earlier than navigate-finish in some cases.
+  function startFlexyObserver(attempts) {
+    attempts = attempts || 0;
+    const flexy = document.querySelector("ytd-watch-flexy");
+    if (!flexy) {
+      if (attempts < 20) setTimeout(() => startFlexyObserver(attempts + 1), 500);
+      return;
+    }
+    const obs = new MutationObserver((muts) => {
+      for (const m of muts) {
+        if (m.type === "attributes" && m.attributeName === "video-id") {
+          check();
+        }
+      }
+    });
+    obs.observe(flexy, { attributes: true, attributeFilter: ["video-id"] });
+    console.log("[yt-printer] mutation observer attached to ytd-watch-flexy");
+  }
+  startFlexyObserver();
 
   console.log("[yt-printer] content script loaded; endpoint =", endpoint);
 })();
